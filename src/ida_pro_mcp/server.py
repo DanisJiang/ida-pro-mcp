@@ -8,8 +8,6 @@ import tempfile
 import traceback
 import tomllib
 import tomli_w
-import signal
-import threading
 from typing import TYPE_CHECKING, Annotated, Optional
 from urllib.parse import urlparse
 import glob
@@ -1227,21 +1225,13 @@ def main():
             else:
                 mcp.serve(url.hostname, url.port)
 
-            # Wait for Ctrl+C signal only (no accidental Enter key termination)
+            # Wait for Ctrl+C (KeyboardInterrupt) - simple loop that can be interrupted
             print("Server is running. Press Ctrl+C to stop.")
-            shutdown_event = threading.Event()
-
-            def signal_handler(signum, frame):
-                print("\nShutting down...")
-                shutdown_event.set()
-
-            signal.signal(signal.SIGINT, signal_handler)
-            signal.signal(signal.SIGTERM, signal_handler)
-
-            # Block until signal received
-            shutdown_event.wait()
-    except (KeyboardInterrupt, EOFError):
-        pass
+            import time
+            while True:
+                time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
     finally:
         if _multi_instance_mode:
             # Stop the instance manager cleanup thread
