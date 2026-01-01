@@ -8,40 +8,244 @@ import tempfile
 import traceback
 import tomllib
 import tomli_w
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, Optional
 from urllib.parse import urlparse
 import glob
 
 if TYPE_CHECKING:
-    from ida_pro_mcp.ida_mcp.zeromcp import McpServer
+    from ida_pro_mcp.ida_mcp.zeromcp import McpServer, McpHttpRequestHandler
     from ida_pro_mcp.ida_mcp.zeromcp.jsonrpc import JsonRpcResponse, JsonRpcRequest
+    from ida_pro_mcp.instance_manager import InstanceManager, get_instance_manager
 else:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ida_mcp"))
-    from zeromcp import McpServer
+    from zeromcp import McpServer, McpHttpRequestHandler
     from zeromcp.jsonrpc import JsonRpcResponse, JsonRpcRequest
 
     sys.path.pop(0)  # Clean up
 
+    from ida_pro_mcp.instance_manager import get_instance_manager
+
+# Legacy single-instance mode settings (used when --ida-rpc is specified)
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
+
+# Multi-instance mode flag
+_multi_instance_mode = False
 
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch
 
 
+# ============================================================================
+# Instance Management MCP Tools (only available in multi-instance mode)
+# ============================================================================
+
+
+@mcp.tool
+def ida_instances() -> list[dict]:
+    """List all connected IDA Pro instances.
+
+    Returns a list of IDA instances with their details including:
+    - id: Unique instance identifier
+    - binary: Name of the binary being analyzed
+    - path: Full path to the binary
+    - port: Port number the instance is listening on
+    - base: Image base address
+    - selected: Whether this instance is currently selected
+    """
+    manager = get_instance_manager()
+    instances = manager.get_instances()
+    if not instances:
+        return [{"message": "No IDA instances connected. Open a binary in IDA Pro and start the MCP plugin."}]
+    return instances
+
+
+@mcp.tool
+def ida_select(
+    instance: Annotated[str, "Instance selector: binary name (supports wildcards), port number, or instance ID"]
+) -> dict:
+    """Select an IDA Pro instance to work with.
+
+    All subsequent MCP tool calls will be routed to the selected instance.
+    You can select an instance by:
+    - Binary name (e.g., 'crackme.exe' or 'crack*' for wildcard matching)
+    - Port number (e.g., '13337')
+    - Instance ID or prefix (e.g., 'a1b2c3d4' or 'a1b2')
+    """
+    manager = get_instance_manager()
+    selected = manager.select(instance)
+    if selected is None:
+        instances = manager.get_instances()
+        if not instances:
+            return {
+                "error": "No IDA instances connected",
+                "hint": "Open a binary in IDA Pro and start the MCP plugin (Ctrl+Alt+M)"
+            }
+        return {
+            "error": f"No instance matching '{instance}' found",
+            "available": [
+                {"binary": inst["binary"], "port": inst["port"], "id": inst["id"][:8]}
+                for inst in instances
+            ]
+        }
+    return {
+        "selected": True,
+        "binary": selected.binary,
+        "path": selected.path,
+        "port": selected.port,
+        "base": selected.base,
+        "id": selected.id
+    }
+
+
+@mcp.tool
+def ida_current() -> dict:
+    """Get information about the currently selected IDA Pro instance."""
+    manager = get_instance_manager()
+    current = manager.get_current()
+    if current is None:
+        instances = manager.get_instances()
+        if not instances:
+            return {
+                "error": "No IDA instances connected",
+                "hint": "Open a binary in IDA Pro and start the MCP plugin (Ctrl+Alt+M)"
+            }
+        return {
+            "error": "No instance selected",
+            "hint": "Use ida_select to choose an instance",
+            "available": len(instances)
+        }
+    return {
+        "binary": current.binary,
+        "path": current.path,
+        "port": current.port,
+        "base": current.base,
+        "id": current.id,
+        "host": current.host
+    }
+
+
+# ============================================================================
+# Request Dispatching
+# ============================================================================
+
+
+# Tools that are handled locally (not forwarded to IDA)
+LOCAL_TOOLS = {"ida_instances", "ida_select", "ida_current"}
+
+
 def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
-    """Dispatch JSON-RPC requests to the MCP server registry"""
+    """Dispatch JSON-RPC requests to the MCP server registry or forward to IDA"""
     if not isinstance(request, dict):
         request_obj: JsonRpcRequest = json.loads(request)
     else:
         request_obj: JsonRpcRequest = request  # type: ignore
 
-    if request_obj["method"] == "initialize":
+    method = request_obj["method"]
+
+    # MCP protocol methods - handle locally
+    if method == "initialize":
         return dispatch_original(request)
-    elif request_obj["method"].startswith("notifications/"):
+    elif method.startswith("notifications/"):
         return dispatch_original(request)
 
-    conn = http.client.HTTPConnection(IDA_HOST, IDA_PORT, timeout=30)
+    # In multi-instance mode, check if this is a local tool or needs forwarding
+    if _multi_instance_mode:
+        # tools/call with local tool name
+        if method == "tools/call":
+            tool_name = request_obj.get("params", {}).get("name", "")
+            if tool_name in LOCAL_TOOLS:
+                return dispatch_original(request)
+
+        # tools/list - merge local tools with IDA tools
+        if method == "tools/list":
+            return _handle_tools_list(request, request_obj)
+
+        # Get target instance
+        manager = get_instance_manager()
+        instance = manager.get_current()
+
+        if instance is None:
+            id = request_obj.get("id")
+            if id is None:
+                return None
+
+            # Check if any instances are connected
+            instances = manager.get_instances()
+            if not instances:
+                return JsonRpcResponse(
+                    {
+                        "jsonrpc": "2.0",
+                        "error": {
+                            "code": -32000,
+                            "message": "No IDA Pro instances connected. Open a binary in IDA and start the MCP plugin (Ctrl+Alt+M).",
+                        },
+                        "id": id,
+                    }
+                )
+            else:
+                return JsonRpcResponse(
+                    {
+                        "jsonrpc": "2.0",
+                        "error": {
+                            "code": -32000,
+                            "message": f"No IDA instance selected. Use ida_select to choose from {len(instances)} connected instance(s).",
+                        },
+                        "id": id,
+                    }
+                )
+
+        # Forward to the selected IDA instance
+        return _forward_to_ida(instance.host, instance.port, request, request_obj)
+    else:
+        # Legacy single-instance mode
+        return _forward_to_ida(IDA_HOST, IDA_PORT, request, request_obj)
+
+
+def _handle_tools_list(request: dict | str | bytes | bytearray, request_obj: dict) -> JsonRpcResponse:
+    """Handle tools/list in multi-instance mode by merging local and IDA tools"""
+    # Get local tools (ida_instances, ida_select, ida_current)
+    local_response = dispatch_original(request)
+    if local_response is None:
+        local_tools = []
+    elif "error" in local_response:
+        return local_response
+    else:
+        local_tools = local_response.get("result", {}).get("tools", [])
+
+    # Try to get tools from the current IDA instance
+    manager = get_instance_manager()
+    instance = manager.get_current()
+
+    if instance is not None:
+        # Forward tools/list to IDA instance
+        ida_response = _forward_to_ida(instance.host, instance.port, request, request_obj)
+        if ida_response is not None and "error" not in ida_response:
+            ida_tools = ida_response.get("result", {}).get("tools", [])
+            # Merge tools: local tools first, then IDA tools
+            all_tools = local_tools + ida_tools
+            return JsonRpcResponse({
+                "jsonrpc": "2.0",
+                "result": {"tools": all_tools},
+                "id": request_obj.get("id"),
+            })
+
+    # No IDA instance or failed to get tools - just return local tools
+    return JsonRpcResponse({
+        "jsonrpc": "2.0",
+        "result": {"tools": local_tools},
+        "id": request_obj.get("id"),
+    })
+
+
+def _forward_to_ida(
+    host: str,
+    port: int,
+    request: dict | str | bytes | bytearray,
+    request_obj: dict
+) -> JsonRpcResponse | None:
+    """Forward a request to an IDA Pro instance"""
+    conn = http.client.HTTPConnection(host, port, timeout=30)
     try:
         if isinstance(request, dict):
             request = json.dumps(request)
@@ -61,12 +265,18 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
             shortcut = "Ctrl+Option+M"
         else:
             shortcut = "Ctrl+Alt+M"
+
+        if _multi_instance_mode:
+            msg = f"Failed to connect to IDA Pro at {host}:{port}. The instance may have disconnected.\n{full_info}"
+        else:
+            msg = f"Failed to connect to IDA Pro! Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n{full_info}"
+
         return JsonRpcResponse(
             {
                 "jsonrpc": "2.0",
                 "error": {
                     "code": -32000,
-                    "message": f"Failed to connect to IDA Pro! Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n{full_info}",
+                    "message": msg,
                     "data": str(e),
                 },
                 "id": id,
@@ -77,6 +287,123 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
 
 
 mcp.registry.dispatch = dispatch_proxy
+
+
+# ============================================================================
+# Multi-Instance HTTP Server
+# ============================================================================
+
+
+class MultiInstanceHttpRequestHandler(McpHttpRequestHandler):
+    """HTTP request handler that also handles instance registration"""
+
+    def do_POST(self):
+        """Handle POST requests including registration endpoints"""
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/register":
+            self._handle_register()
+        elif path == "/unregister":
+            self._handle_unregister()
+        elif path == "/heartbeat":
+            self._handle_heartbeat()
+        else:
+            super().do_POST()
+
+    def do_GET(self):
+        """Handle GET requests including instance list endpoint"""
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/instances":
+            self._handle_instances_get()
+        else:
+            super().do_GET()
+
+    def _send_json_response(self, status: int, data: dict):
+        """Send a JSON response"""
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json_body(self) -> Optional[dict]:
+        """Read and parse JSON body from request"""
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            return None
+        try:
+            body = self.rfile.read(content_length)
+            return json.loads(body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+
+    def _handle_register(self):
+        """Handle instance registration from IDA plugin"""
+        data = self._read_json_body()
+        if data is None:
+            self._send_json_response(400, {"error": "Invalid JSON body"})
+            return
+
+        required_fields = ["id", "host", "port", "binary", "path", "base"]
+        missing = [f for f in required_fields if f not in data]
+        if missing:
+            self._send_json_response(400, {"error": f"Missing fields: {missing}"})
+            return
+
+        manager = get_instance_manager()
+        success = manager.register(
+            id=data["id"],
+            host=data["host"],
+            port=data["port"],
+            binary=data["binary"],
+            path=data["path"],
+            base=data["base"],
+        )
+
+        if success:
+            self._send_json_response(200, {"status": "registered", "id": data["id"]})
+        else:
+            self._send_json_response(409, {"error": "Registration failed"})
+
+    def _handle_unregister(self):
+        """Handle instance unregistration from IDA plugin"""
+        data = self._read_json_body()
+        if data is None or "id" not in data:
+            self._send_json_response(400, {"error": "Missing 'id' field"})
+            return
+
+        manager = get_instance_manager()
+        success = manager.unregister(data["id"])
+
+        if success:
+            self._send_json_response(200, {"status": "unregistered"})
+        else:
+            self._send_json_response(404, {"error": "Instance not found"})
+
+    def _handle_heartbeat(self):
+        """Handle heartbeat from IDA plugin"""
+        data = self._read_json_body()
+        if data is None or "id" not in data:
+            self._send_json_response(400, {"error": "Missing 'id' field"})
+            return
+
+        manager = get_instance_manager()
+        success = manager.heartbeat(data["id"])
+
+        if success:
+            self._send_json_response(200, {"status": "ok"})
+        else:
+            self._send_json_response(404, {"error": "Instance not found"})
+
+    def _handle_instances_get(self):
+        """Handle GET /instances for debugging"""
+        manager = get_instance_manager()
+        instances = manager.get_instances()
+        self._send_json_response(200, {"instances": instances})
 
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -818,7 +1145,7 @@ def install_ida_plugin(
 
 
 def main():
-    global IDA_HOST, IDA_PORT
+    global IDA_HOST, IDA_PORT, _multi_instance_mode
     parser = argparse.ArgumentParser(description="IDA Pro MCP Server")
     parser.add_argument(
         "--install", action="store_true", help="Install the MCP Server and IDA plugin"
@@ -842,20 +1169,28 @@ def main():
     parser.add_argument(
         "--ida-rpc",
         type=str,
-        default=f"http://{IDA_HOST}:{IDA_PORT}",
-        help=f"IDA RPC server to use (default: http://{IDA_HOST}:{IDA_PORT})",
+        default=None,
+        help=f"IDA RPC server to use for single-instance mode (default: multi-instance mode)",
     )
     parser.add_argument(
         "--config", action="store_true", help="Generate MCP config JSON"
     )
     args = parser.parse_args()
 
-    # Parse IDA RPC server argument
-    ida_rpc = urlparse(args.ida_rpc)
-    if ida_rpc.hostname is None or ida_rpc.port is None:
-        raise Exception(f"Invalid IDA RPC server: {args.ida_rpc}")
-    IDA_HOST = ida_rpc.hostname
-    IDA_PORT = ida_rpc.port
+    # Determine mode: single-instance (legacy) or multi-instance
+    if args.ida_rpc is not None:
+        # Legacy single-instance mode
+        ida_rpc = urlparse(args.ida_rpc)
+        if ida_rpc.hostname is None or ida_rpc.port is None:
+            raise Exception(f"Invalid IDA RPC server: {args.ida_rpc}")
+        IDA_HOST = ida_rpc.hostname
+        IDA_PORT = ida_rpc.port
+        _multi_instance_mode = False
+        print(f"[MCP] Single-instance mode: connecting to {IDA_HOST}:{IDA_PORT}")
+    else:
+        # Multi-instance mode (default)
+        _multi_instance_mode = True
+        print("[MCP] Multi-instance mode: IDA instances will register dynamically")
 
     if args.install and args.uninstall:
         print("Cannot install and uninstall at the same time")
@@ -883,10 +1218,20 @@ def main():
             if url.hostname is None or url.port is None:
                 raise Exception(f"Invalid transport URL: {args.transport}")
             # NOTE: npx -y @modelcontextprotocol/inspector for debugging
-            mcp.serve(url.hostname, url.port)
+            if _multi_instance_mode:
+                # Use custom handler for multi-instance registration
+                mcp.serve(url.hostname, url.port, request_handler=MultiInstanceHttpRequestHandler)
+                print(f"[MCP] Registration endpoint: http://{url.hostname}:{url.port}/register")
+            else:
+                mcp.serve(url.hostname, url.port)
             input("Server is running, press Enter or Ctrl+C to stop.")
     except (KeyboardInterrupt, EOFError):
         pass
+    finally:
+        if _multi_instance_mode:
+            # Stop the instance manager cleanup thread
+            manager = get_instance_manager()
+            manager.stop()
 
 
 if __name__ == "__main__":
