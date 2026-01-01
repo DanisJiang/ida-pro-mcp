@@ -206,28 +206,12 @@ def _handle_tools_list(request: dict | str | bytes | bytearray, request_obj: dic
     """Handle tools/list in multi-instance mode by merging local and IDA tools"""
     request_id = request_obj.get("id")
 
-    # Get local tools (ida_instances, ida_select, ida_current)
-    # Call dispatch_original with a proper JSON-RPC request dict
-    local_request = {
-        "jsonrpc": "2.0",
-        "method": "tools/list",
-        "params": request_obj.get("params"),
-        "id": request_id,
-    }
-    try:
-        local_response = dispatch_original(local_request)
-    except Exception:
-        local_response = None
-
-    if local_response is None:
-        local_tools = []
-    elif isinstance(local_response, dict) and "error" in local_response:
-        # Don't return error, just use empty local tools
-        local_tools = []
-    elif isinstance(local_response, dict):
-        local_tools = local_response.get("result", {}).get("tools", [])
-    else:
-        local_tools = []
+    # Get local tools directly from mcp.tools.methods
+    # This is more reliable than going through dispatch_original
+    local_tools = [
+        mcp._generate_tool_schema(func_name, func)
+        for func_name, func in mcp.tools.methods.items()
+    ]
 
     # Try to get tools from the current IDA instance
     manager = get_instance_manager()
