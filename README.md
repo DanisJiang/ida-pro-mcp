@@ -157,9 +157,23 @@ Multi-instance mode allows you to connect multiple IDA Pro instances to a single
    ```
 
 2. Set the `IDA_MCP_SERVER` environment variable before starting IDA Pro:
+
+   **Linux/macOS:**
    ```sh
    export IDA_MCP_SERVER=http://127.0.0.1:8744
    ida64 /path/to/binary_a
+   ```
+
+   **Windows (PowerShell):**
+   ```powershell
+   $env:IDA_MCP_SERVER="http://127.0.0.1:8744"
+   ida64.exe C:\path\to\binary_a.exe
+   ```
+
+   **Windows (CMD):**
+   ```cmd
+   set IDA_MCP_SERVER=http://127.0.0.1:8744
+   ida64.exe C:\path\to\binary_a.exe
    ```
 
 3. Open multiple IDA instances with different binaries, then start the MCP plugin in each (Ctrl+Alt+M).
