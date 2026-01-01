@@ -145,6 +145,40 @@ uv run idalib-mcp --host 127.0.0.1 --port 8745 path/to/executable
 
 _Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://github.com/williballenthin).
 
+## Multi-Instance Mode
+
+Multi-instance mode allows you to connect multiple IDA Pro instances to a single MCP server, enabling simultaneous analysis of multiple binaries.
+
+**Setup:**
+
+1. Start the MCP server in multi-instance mode (default when using HTTP transport):
+   ```sh
+   uv run ida-pro-mcp --transport http://0.0.0.0:8744/sse
+   ```
+
+2. Set the `IDA_MCP_SERVER` environment variable before starting IDA Pro:
+   ```sh
+   export IDA_MCP_SERVER=http://127.0.0.1:8744
+   ida64 /path/to/binary_a
+   ```
+
+3. Open multiple IDA instances with different binaries, then start the MCP plugin in each (Ctrl+Alt+M).
+
+4. Use the instance management tools in your MCP client:
+   - `ida_instances()` - List all connected IDA instances
+   - `ida_select("binary_name")` - Select an instance by binary name, port, or ID
+   - `ida_current()` - Get information about the currently selected instance
+
+For headless mode with idalib:
+```sh
+uv run idalib-mcp --mcp-server http://127.0.0.1:8744 --port 8745 path/to/binary
+```
+
+To use legacy single-instance mode, specify `--ida-rpc`:
+```sh
+uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse --ida-rpc http://127.0.0.1:13337
+```
+
 
 ## MCP Resources
 
