@@ -8,6 +8,8 @@ import tempfile
 import traceback
 import tomllib
 import tomli_w
+import signal
+import threading
 from typing import TYPE_CHECKING, Annotated, Optional
 from urllib.parse import urlparse
 import glob
@@ -1224,7 +1226,20 @@ def main():
                 print(f"[MCP] Registration endpoint: http://{url.hostname}:{url.port}/register")
             else:
                 mcp.serve(url.hostname, url.port)
-            input("Server is running, press Enter or Ctrl+C to stop.")
+
+            # Wait for Ctrl+C signal only (no accidental Enter key termination)
+            print("Server is running. Press Ctrl+C to stop.")
+            shutdown_event = threading.Event()
+
+            def signal_handler(signum, frame):
+                print("\nShutting down...")
+                shutdown_event.set()
+
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
+
+            # Block until signal received
+            shutdown_event.wait()
     except (KeyboardInterrupt, EOFError):
         pass
     finally:
