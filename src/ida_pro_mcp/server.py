@@ -204,38 +204,53 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
 
 def _handle_tools_list(request: dict | str | bytes | bytearray, request_obj: dict) -> JsonRpcResponse:
     """Handle tools/list in multi-instance mode by merging local and IDA tools"""
+    request_id = request_obj.get("id")
+
     # Get local tools (ida_instances, ida_select, ida_current)
-    local_response = dispatch_original(request)
+    # Call dispatch_original with a proper JSON-RPC request dict
+    local_request = {
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "params": request_obj.get("params"),
+        "id": request_id,
+    }
+    try:
+        local_response = dispatch_original(local_request)
+    except Exception:
+        local_response = None
+
     if local_response is None:
         local_tools = []
-    elif "error" in local_response:
-        return local_response
-    else:
+    elif isinstance(local_response, dict) and "error" in local_response:
+        # Don't return error, just use empty local tools
+        local_tools = []
+    elif isinstance(local_response, dict):
         local_tools = local_response.get("result", {}).get("tools", [])
+    else:
+        local_tools = []
 
     # Try to get tools from the current IDA instance
     manager = get_instance_manager()
     instance = manager.get_current()
 
+    ida_tools = []
     if instance is not None:
         # Forward tools/list to IDA instance
-        ida_response = _forward_to_ida(instance.host, instance.port, request, request_obj)
-        if ida_response is not None and "error" not in ida_response:
-            ida_tools = ida_response.get("result", {}).get("tools", [])
-            # Merge tools: local tools first, then IDA tools
-            all_tools = local_tools + ida_tools
-            return JsonRpcResponse({
-                "jsonrpc": "2.0",
-                "result": {"tools": all_tools},
-                "id": request_obj.get("id"),
-            })
+        try:
+            ida_response = _forward_to_ida(instance.host, instance.port, request, request_obj)
+            if ida_response is not None and isinstance(ida_response, dict) and "error" not in ida_response:
+                ida_tools = ida_response.get("result", {}).get("tools", [])
+        except Exception:
+            pass  # Failed to get IDA tools, continue with local tools only
 
-    # No IDA instance or failed to get tools - just return local tools
-    return JsonRpcResponse({
+    # Merge tools: local tools first, then IDA tools
+    all_tools = local_tools + ida_tools
+
+    return {
         "jsonrpc": "2.0",
-        "result": {"tools": local_tools},
-        "id": request_obj.get("id"),
-    })
+        "result": {"tools": all_tools},
+        "id": request_id,
+    }
 
 
 def _forward_to_ida(
