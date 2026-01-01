@@ -32,6 +32,7 @@ class IdalibRegistration:
         self.server_url = server_url
         self._parsed_url = urlparse(server_url)
         self._heartbeat_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()  # For interruptible sleep
         self._running = False
         self._registered = False
 
@@ -108,6 +109,7 @@ class IdalibRegistration:
             return
 
         self._running = True
+        self._stop_event.clear()
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
             daemon=True,
@@ -118,15 +120,17 @@ class IdalibRegistration:
     def _stop_heartbeat(self):
         """Stop the heartbeat thread"""
         self._running = False
+        self._stop_event.set()  # Wake up the heartbeat thread immediately
         if self._heartbeat_thread:
             self._heartbeat_thread.join(timeout=2.0)
             self._heartbeat_thread = None
 
     def _heartbeat_loop(self):
         """Background thread that sends periodic heartbeats"""
-        import time
         while self._running:
-            time.sleep(self.HEARTBEAT_INTERVAL)
+            # Use event.wait() instead of time.sleep() so we can be interrupted
+            if self._stop_event.wait(timeout=self.HEARTBEAT_INTERVAL):
+                break  # Event was set, stop requested
             if not self._running:
                 break
             data = {"id": self.instance_id}

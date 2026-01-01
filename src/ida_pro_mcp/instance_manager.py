@@ -54,6 +54,7 @@ class InstanceManager:
         self._current_id: Optional[str] = None  # Currently selected instance ID
         self._lock = threading.RLock()  # Reentrant lock for thread safety
         self._cleanup_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()  # For interruptible sleep
         self._running = False
 
     def start(self):
@@ -62,6 +63,7 @@ class InstanceManager:
             return
 
         self._running = True
+        self._stop_event.clear()
         self._cleanup_thread = threading.Thread(
             target=self._cleanup_loop, daemon=True, name="InstanceManager-Cleanup"
         )
@@ -70,14 +72,17 @@ class InstanceManager:
     def stop(self):
         """Stop the instance manager"""
         self._running = False
+        self._stop_event.set()  # Wake up the cleanup thread immediately
         if self._cleanup_thread:
-            self._cleanup_thread.join(timeout=5.0)
+            self._cleanup_thread.join(timeout=2.0)
             self._cleanup_thread = None
 
     def _cleanup_loop(self):
         """Background thread that removes stale instances"""
         while self._running:
-            time.sleep(self.CLEANUP_INTERVAL)
+            # Use event.wait() instead of time.sleep() so we can be interrupted
+            if self._stop_event.wait(timeout=self.CLEANUP_INTERVAL):
+                break  # Event was set, stop requested
             if not self._running:
                 break
             self._cleanup_stale_instances()
